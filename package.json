@@ -1,0 +1,18 @@
+{
+  "name": "aether-n8n-mcp",
+  "version": "0.1.0",
+  "description": "AETHER MCP server for editing n8n workflows via the n8n API.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "express": "^4.19.2",
+    "zod": "^3.23.8"
+  }
+}
