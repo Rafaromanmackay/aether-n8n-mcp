@@ -125,12 +125,51 @@ function createServer() {
     async ({ workflowId, name }) => {
       const existing = await n8nRequest(`/workflows/${workflowId}`);
 
-  const payload = {
-  name,
-  nodes: existing.nodes || [],
-  connections: existing.connections || {},
-  settings: {}
-};
+      const payload = {
+        name,
+        nodes: existing.nodes || [],
+        connections: existing.connections || {},
+        settings: {}
+      };
+
+      const result = await n8nRequest(`/workflows/${workflowId}`, {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      });
+
+      return formatResult(result);
+    }
+  );
+
+  server.tool(
+    "add_sticky_note",
+    "Add a sticky note node to an existing n8n workflow without changing workflow logic.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID."),
+      content: z.string().describe("The sticky note content."),
+      x: z.number().optional().describe("X position on the canvas."),
+      y: z.number().optional().describe("Y position on the canvas.")
+    },
+    async ({ workflowId, content, x = 0, y = 0 }) => {
+      const existing = await n8nRequest(`/workflows/${workflowId}`);
+
+      const stickyNode = {
+        parameters: {
+          content
+        },
+        id: crypto.randomUUID(),
+        name: `Sticky Note ${Date.now()}`,
+        type: "n8n-nodes-base.stickyNote",
+        typeVersion: 1,
+        position: [x, y]
+      };
+
+      const payload = {
+        name: existing.name,
+        nodes: [...(existing.nodes || []), stickyNode],
+        connections: existing.connections || {},
+        settings: {}
+      };
 
       const result = await n8nRequest(`/workflows/${workflowId}`, {
         method: "PUT",
@@ -206,6 +245,7 @@ app.get("/", (req, res) => {
       "list_workflows",
       "get_workflow",
       "rename_workflow",
+      "add_sticky_note",
       "update_workflow",
       "activate_workflow",
       "deactivate_workflow"
