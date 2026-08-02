@@ -116,6 +116,33 @@ function createServer() {
   );
 
   server.tool(
+    "rename_workflow",
+    "Rename an existing n8n workflow by ID. This safely fetches the existing workflow and only changes the name.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID."),
+      name: z.string().describe("The new workflow name.")
+    },
+    async ({ workflowId, name }) => {
+      const existing = await n8nRequest(`/workflows/${workflowId}`);
+
+      const payload = {
+        name,
+        nodes: existing.nodes || [],
+        connections: existing.connections || {},
+        settings: existing.settings || {},
+        active: existing.active || false
+      };
+
+      const result = await n8nRequest(`/workflows/${workflowId}`, {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      });
+
+      return formatResult(result);
+    }
+  );
+
+  server.tool(
     "update_workflow",
     "Update an existing n8n workflow. Use carefully and only with a full workflow payload.",
     {
@@ -127,6 +154,7 @@ function createServer() {
         method: "PUT",
         body: JSON.stringify(workflow)
       });
+
       return formatResult(result);
     }
   );
@@ -141,6 +169,7 @@ function createServer() {
       const result = await n8nRequest(`/workflows/${workflowId}/activate`, {
         method: "POST"
       });
+
       return formatResult(result);
     }
   );
@@ -155,6 +184,7 @@ function createServer() {
       const result = await n8nRequest(`/workflows/${workflowId}/deactivate`, {
         method: "POST"
       });
+
       return formatResult(result);
     }
   );
@@ -176,6 +206,7 @@ app.get("/", (req, res) => {
     tools: [
       "list_workflows",
       "get_workflow",
+      "rename_workflow",
       "update_workflow",
       "activate_workflow",
       "deactivate_workflow"
