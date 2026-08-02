@@ -125,11 +125,11 @@ function createServer() {
     async ({ workflowId, name }) => {
       const existing = await n8nRequest(`/workflows/${workflowId}`);
 
-      const payload = {
+  const payload = {
   name,
   nodes: existing.nodes || [],
   connections: existing.connections || {},
-  settings: existing.settings || {}
+  settings: {}
 };
 
       const result = await n8nRequest(`/workflows/${workflowId}`, {
