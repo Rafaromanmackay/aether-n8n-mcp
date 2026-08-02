@@ -6,14 +6,40 @@ import { z } from "zod";
 const PORT = process.env.PORT || 3000;
 const N8N_API_URL = process.env.N8N_API_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 function requireEnv() {
   if (!N8N_API_URL) {
     throw new Error("Missing N8N_API_URL");
   }
+
   if (!N8N_API_KEY) {
     throw new Error("Missing N8N_API_KEY");
   }
+
+  if (!MCP_AUTH_TOKEN) {
+    throw new Error("Missing MCP_AUTH_TOKEN");
+  }
+}
+
+function requireAuth(req, res, next) {
+  if (!MCP_AUTH_TOKEN) {
+    console.error("MCP_AUTH_TOKEN is not configured");
+    return res.status(500).json({
+      error: "MCP server auth is not configured"
+    });
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const expectedHeader = `Bearer ${MCP_AUTH_TOKEN}`;
+
+  if (authHeader !== expectedHeader) {
+    return res.status(401).json({
+      error: "Unauthorized"
+    });
+  }
+
+  next();
 }
 
 async function n8nRequest(path, options = {}) {
@@ -146,6 +172,7 @@ app.get("/", (req, res) => {
     status: "ok",
     mcpEndpoint: "/mcp",
     transport: "sse",
+    auth: "bearer",
     tools: [
       "list_workflows",
       "get_workflow",
@@ -156,7 +183,7 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/mcp", async (req, res) => {
+app.get("/mcp", requireAuth, async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
 
@@ -168,16 +195,21 @@ app.get("/mcp", async (req, res) => {
   await server.connect(transport);
 });
 
-app.post("/messages", express.json({ limit: "10mb" }), async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
+app.post(
+  "/messages",
+  requireAuth,
+  express.json({ limit: "10mb" }),
+  async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = transports[sessionId];
 
-  if (!transport) {
-    return res.status(400).send("No transport found for sessionId");
+    if (!transport) {
+      return res.status(400).send("No transport found for sessionId");
+    }
+
+    await transport.handlePostMessage(req, res, req.body);
   }
-
-  await transport.handlePostMessage(req, res, req.body);
-});
+);
 
 app.listen(PORT, () => {
   console.log(`AETHER n8n MCP SSE server running on port ${PORT}`);
