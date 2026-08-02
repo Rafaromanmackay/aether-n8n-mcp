@@ -12,7 +12,7 @@ const N8N_WEBHOOK_BASE_URL = process.env.N8N_WEBHOOK_BASE_URL;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 const SERVER_NAME = "aether-n8n-mcp";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.6.0";
 
 const TOOL_NAMES = [
   "list_workflows",
@@ -104,7 +104,6 @@ function requireAuth(req, res, next) {
 function buildUrl(base, path) {
   const cleanBase = base.replace(/\/+$/, "");
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
-
   return `${cleanBase}${cleanPath}`;
 }
 
@@ -364,7 +363,8 @@ function publicStatus() {
       workflowRegistry: true,
       simulationMode: true,
       executionResultStandard: true,
-      automaticLedgerLogging: false
+      automaticLedgerLogging: true,
+      notionLedgerConfigured: LEDGER_CONFIGURED
     },
     workflowRegistry: Object.values(WORKFLOW_REGISTRY).map((workflow) => ({
       key: workflow.key,
@@ -381,6 +381,174 @@ function publicStatus() {
       webhookBaseUrlConfigured: Boolean(N8N_WEBHOOK_BASE_URL)
     }
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// AETHER MCP v0.6.0 — Notion Execution Ledger
+// "La IA propone. AETHER autoriza. El sistema ejecuta. El ledger registra."
+// ─────────────────────────────────────────────────────────────
+
+const NOTION_API_KEY = process.env.NOTION_API_KEY || "";
+const NOTION_VERSION = process.env.NOTION_VERSION || "2025-09-03";
+const LEDGER_DATA_SOURCE_ID = process.env.NOTION_EXECUTION_LEDGER_DATA_SOURCE_ID || "";
+const LEDGER_DATABASE_ID = process.env.NOTION_EXECUTION_LEDGER_DATABASE_ID || "";
+const LEDGER_TIMEOUT_MS = Number(process.env.NOTION_TIMEOUT_MS || 8000);
+
+const LEDGER_CONFIGURED = Boolean(
+  NOTION_API_KEY && (LEDGER_DATA_SOURCE_ID || LEDGER_DATABASE_ID)
+);
+
+const MAX_TEXT = 1900; // Notion rich_text corta en 2000
+
+function truncate(value) {
+  if (value === undefined || value === null) return "";
+  const str = typeof value === "string" ? value : JSON.stringify(value);
+  return str.length > MAX_TEXT ? str.slice(0, MAX_TEXT - 3) + "..." : str;
+}
+
+function richText(value) {
+  const content = truncate(value);
+  if (!content) return { rich_text: [] };
+  return { rich_text: [{ type: "text", text: { content } }] };
+}
+
+function selectValue(name) {
+  return name ? { select: { name: String(name) } } : { select: null };
+}
+
+// notionRequest(): nunca lanza. Siempre devuelve { ok, status, data, error }.
+async function notionRequest(method, path, body) {
+  if (!NOTION_API_KEY) {
+    return { ok: false, status: 0, error: "NOTION_API_KEY not configured" };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LEDGER_TIMEOUT_MS);
+
+  try {
+    const res = await fetch("https://api.notion.com/v1" + path, {
+      method,
+      headers: {
+        Authorization: `Bearer ${NOTION_API_KEY}`,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json"
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal
+    });
+
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        error: (data && (data.message || data.code)) || `HTTP ${res.status}`,
+        data
+      };
+    }
+    return { ok: true, status: res.status, data };
+  } catch (err) {
+    const aborted = err && err.name === "AbortError";
+    return {
+      ok: false,
+      status: 0,
+      error: aborted ? `Notion timeout after ${LEDGER_TIMEOUT_MS}ms` : String(err && err.message || err)
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Mapea un evento AETHER al schema exacto del Execution Ledger.
+function buildLedgerProperties(event) {
+  const props = {
+    "Event": { title: [{ type: "text", text: { content: truncate(event.title || "Untitled event") } }] },
+    "Timestamp": { date: { start: event.timestamp || new Date().toISOString() } },
+    "Actor": selectValue(event.actor || "AETHER MCP"),
+    "Action": selectValue(event.action || "execute_workflow"),
+    "Resource Name": richText(event.resourceName),
+    "Resource ID": richText(event.resourceId),
+    "Environment": selectValue(event.environment || "sandbox"),
+    "Policy Decision": selectValue(event.policyDecision),
+    "Approval": selectValue(event.approval || "not_required"),
+    "Status": { status: { name: event.status || "requested" } },
+    "Risk Level": selectValue(event.riskLevel || "low"),
+    "Input Payload": richText(event.inputPayload),
+    "Output Payload": richText(event.outputPayload),
+    "Error": richText(event.error),
+    "Notes": richText(event.notes)
+  };
+
+  if (typeof event.durationMs === "number" && !Number.isNaN(event.durationMs)) {
+    props["Duration ms"] = { number: Math.round(event.durationMs) };
+  }
+
+  return props;
+}
+
+function ledgerParent() {
+  // API 2025-09-03 usa data_source_id. Fallback a database_id para versiones antiguas.
+  if (LEDGER_DATA_SOURCE_ID) {
+    return { type: "data_source_id", data_source_id: LEDGER_DATA_SOURCE_ID };
+  }
+  return { type: "database_id", database_id: LEDGER_DATABASE_ID };
+}
+
+// createNotionLedgerPage(): crea la fila inicial del evento.
+async function createNotionLedgerPage(event) {
+  if (!LEDGER_CONFIGURED) {
+    return { logged: false, error: "ledger not configured" };
+  }
+
+  const res = await notionRequest("POST", "/pages", {
+    parent: ledgerParent(),
+    properties: buildLedgerProperties(event)
+  });
+
+  if (!res.ok) {
+    console.error("[aether:ledger] create failed:", res.status, res.error);
+    return { logged: false, error: res.error };
+  }
+
+  return {
+    logged: true,
+    ledgerEventId: res.data.id,
+    notionPageUrl: res.data.url
+  };
+}
+
+// updateNotionLedgerPage(): cierra el evento con el resultado real.
+async function updateNotionLedgerPage(pageId, event) {
+  if (!LEDGER_CONFIGURED || !pageId) {
+    return { logged: false, error: "ledger not configured or missing pageId" };
+  }
+
+  const res = await notionRequest("PATCH", `/pages/${pageId}`, {
+    properties: buildLedgerProperties(event)
+  });
+
+  if (!res.ok) {
+    console.error("[aether:ledger] update failed:", res.status, res.error);
+    return { logged: false, error: res.error };
+  }
+
+  return { logged: true, ledgerEventId: res.data.id, notionPageUrl: res.data.url };
+}
+
+// logExecutionEvent(): API única para el resto del MCP.
+// Crea si no hay ledgerEventId, actualiza si lo hay. Nunca lanza.
+async function logExecutionEvent(event, existingPageId) {
+  try {
+    return existingPageId
+      ? await updateNotionLedgerPage(existingPageId, event)
+      : await createNotionLedgerPage(event);
+  } catch (err) {
+    console.error("[aether:ledger] unexpected:", err);
+    return { logged: false, error: String(err && err.message || err) };
+  }
 }
 
 function createServer() {
@@ -562,34 +730,45 @@ function createServer() {
     }) => {
       const action = "execute_workflow";
       const eventId = createEventId(action);
+      const requestedAt = nowIso();
 
-      const workflow = resolveWorkflow({
-        workflowId,
-        workflowKey
-      });
+      const workflow = resolveWorkflow({ workflowId, workflowKey });
+      const policy = authorizeAction({ actor, action, workflow });
 
-      const policy = authorizeAction({
-        actor,
-        action,
-        workflow
-      });
-
+      // ── Simulación o bloqueo por policy (lógica v0.5 intacta) ──
       if (simulate || !policy.allowed) {
-        return formatResult(
-          createSimulationResult({
-            eventId,
-            actor,
-            action,
-            workflow,
-            policy,
-            input: {
-              workflowId,
-              workflowKey
-            }
-          })
-        );
+        const simResult = createSimulationResult({
+          eventId,
+          actor,
+          action,
+          workflow,
+          policy,
+          input: { workflowId, workflowKey }
+        });
+
+        const status = policy.decision === "allowed" ? "simulated" : "blocked";
+
+        const log = await logExecutionEvent({
+          title: `${eventId} — ${workflow?.key || workflowKey || workflowId || "unknown"} — ${status}`,
+          timestamp: requestedAt,
+          actor,
+          action: simulate ? "simulate_action" : "execute_workflow",
+          resourceName: workflow?.name || workflowKey || workflowId,
+          resourceId: workflow?.id || workflowId || null,
+          environment: workflow?.environment || "unknown",
+          policyDecision: policy.decision,
+          approval: policy.requiresApproval ? "manual_required" : "not_required",
+          status,
+          riskLevel: policy.riskLevel,
+          inputPayload: { workflowId, workflowKey, simulate },
+          outputPayload: simResult,
+          notes: policy.reason
+        });
+
+        return formatResult({ ...simResult, ledger: log });
       }
 
+      // ── Método de ejecución no soportado (lógica v0.5 intacta) ──
       if (workflow.executionMethod !== "webhook") {
         const blockedPolicy = {
           ...policy,
@@ -599,23 +778,56 @@ function createServer() {
           reason: `Execution method ${workflow.executionMethod} is not executable by this tool.`
         };
 
-        return formatResult(
-          createSimulationResult({
-            eventId,
-            actor,
-            action,
-            workflow,
-            policy: blockedPolicy,
-            input: {
-              workflowId,
-              workflowKey
-            }
-          })
-        );
+        const simResult = createSimulationResult({
+          eventId,
+          actor,
+          action,
+          workflow,
+          policy: blockedPolicy,
+          input: { workflowId, workflowKey }
+        });
+
+        const log = await logExecutionEvent({
+          title: `${eventId} — ${workflow.key} — blocked`,
+          timestamp: requestedAt,
+          actor,
+          action: "execute_workflow",
+          resourceName: workflow.name,
+          resourceId: workflow.id,
+          environment: workflow.environment,
+          policyDecision: blockedPolicy.decision,
+          approval: "manual_required",
+          status: "blocked",
+          riskLevel: blockedPolicy.riskLevel,
+          inputPayload: { workflowId, workflowKey, simulate },
+          outputPayload: simResult,
+          notes: blockedPolicy.reason
+        });
+
+        return formatResult({ ...simResult, ledger: log });
       }
 
+      // ── Ejecución real vía webhook (lógica v0.5 intacta) ──
       const startedAt = nowIso();
       const startTime = Date.now();
+
+      const opened = await logExecutionEvent({
+        title: `${eventId} — ${workflow.key} — running`,
+        timestamp: requestedAt,
+        actor,
+        action: "execute_workflow",
+        resourceName: workflow.name,
+        resourceId: workflow.id,
+        environment: workflow.environment,
+        policyDecision: policy.decision,
+        approval: policy.requiresApproval ? "manual_required" : "automatic",
+        status: "running",
+        riskLevel: policy.riskLevel,
+        inputPayload: { workflowId, workflowKey, simulate },
+        notes: "Execution in progress."
+      });
+
+      const ledgerEventId = opened.ledgerEventId || null;
 
       try {
         const webhookUrl = buildN8nWebhookUrl(workflow.webhookPath);
@@ -626,7 +838,7 @@ function createServer() {
           workflowId: workflow.id,
           workflowName: workflow.name,
           environment: workflow.environment,
-          milestone: "AETHER MCP v0.5 governed execution",
+          milestone: "AETHER MCP v0.6 governed execution",
           eventId,
           requestedAt: startedAt
         });
@@ -634,42 +846,77 @@ function createServer() {
         const finishedAt = nowIso();
         const durationMs = Date.now() - startTime;
 
-        return formatResult(
-          createExecutionResult({
-            eventId,
-            actor,
-            action,
-            workflow,
-            policy,
-            startedAt,
-            finishedAt,
-            durationMs,
-            status: "success",
-            result,
-            error: null
-          })
-        );
+        const execResult = createExecutionResult({
+          eventId, actor, action, workflow, policy,
+          startedAt, finishedAt, durationMs,
+          status: "success", result, error: null
+        });
+
+        const closed = await logExecutionEvent({
+          title: `${eventId} — ${workflow.key} — success`,
+          timestamp: requestedAt,
+          actor,
+          action: "execute_workflow",
+          resourceName: workflow.name,
+          resourceId: workflow.id,
+          environment: workflow.environment,
+          policyDecision: policy.decision,
+          approval: policy.requiresApproval ? "manual_required" : "automatic",
+          status: "success",
+          riskLevel: policy.riskLevel,
+          durationMs,
+          inputPayload: { workflowId, workflowKey, simulate },
+          outputPayload: result,
+          notes: "Logged automáticamente por AETHER MCP v0.6.0"
+        }, ledgerEventId);
+
+        return formatResult({
+          ...execResult,
+          ledger: {
+            logged: opened.logged && closed.logged,
+            ledgerEventId,
+            notionPageUrl: opened.notionPageUrl || null,
+            error: opened.error || closed.error || null
+          }
+        });
       } catch (error) {
         const finishedAt = nowIso();
         const durationMs = Date.now() - startTime;
 
-        return formatResult(
-          createExecutionResult({
-            eventId,
-            actor,
-            action,
-            workflow,
-            policy,
-            startedAt,
-            finishedAt,
-            durationMs,
-            status: "failed",
-            result: null,
-            error: {
-              message: error.message
-            }
-          })
-        );
+        const execResult = createExecutionResult({
+          eventId, actor, action, workflow, policy,
+          startedAt, finishedAt, durationMs,
+          status: "failed", result: null,
+          error: { message: error.message }
+        });
+
+        const closed = await logExecutionEvent({
+          title: `${eventId} — ${workflow.key} — failed`,
+          timestamp: requestedAt,
+          actor,
+          action: "execute_workflow",
+          resourceName: workflow.name,
+          resourceId: workflow.id,
+          environment: workflow.environment,
+          policyDecision: policy.decision,
+          approval: policy.requiresApproval ? "manual_required" : "automatic",
+          status: "failed",
+          riskLevel: policy.riskLevel,
+          durationMs,
+          inputPayload: { workflowId, workflowKey, simulate },
+          error: error.message,
+          notes: "Execution threw an error; see Error field."
+        }, ledgerEventId);
+
+        return formatResult({
+          ...execResult,
+          ledger: {
+            logged: opened.logged && closed.logged,
+            ledgerEventId,
+            notionPageUrl: opened.notionPageUrl || null,
+            error: opened.error || closed.error || null
+          }
+        });
       }
     }
   );
