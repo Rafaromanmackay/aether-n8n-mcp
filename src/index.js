@@ -4,9 +4,18 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
 const PORT = process.env.PORT || 3000;
+
 const N8N_API_URL = process.env.N8N_API_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
+const N8N_WEBHOOK_BASE_URL = process.env.N8N_WEBHOOK_BASE_URL;
+
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+
+const SERVER_NAME = "aether-n8n-mcp";
+const SERVER_VERSION = "0.4.0";
+
+const SANDBOX_WORKFLOW_ID = "PUvD2zLvDp9kBNQt";
+const SANDBOX_WEBHOOK_PATH = "/webhook/aether-mcp-sandbox-execute";
 
 const TOOL_NAMES = [
   "list_workflows",
@@ -20,16 +29,28 @@ const TOOL_NAMES = [
 ];
 
 function requireEnv() {
+  const missing = [];
+
   if (!N8N_API_URL) {
-    throw new Error("Missing N8N_API_URL");
+    missing.push("N8N_API_URL");
   }
 
   if (!N8N_API_KEY) {
-    throw new Error("Missing N8N_API_KEY");
+    missing.push("N8N_API_KEY");
   }
 
   if (!MCP_AUTH_TOKEN) {
-    throw new Error("Missing MCP_AUTH_TOKEN");
+    missing.push("MCP_AUTH_TOKEN");
+  }
+
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+  }
+}
+
+function requireWebhookEnv() {
+  if (!N8N_WEBHOOK_BASE_URL) {
+    throw new Error("Missing N8N_WEBHOOK_BASE_URL");
   }
 }
 
@@ -54,11 +75,31 @@ function requireAuth(req, res, next) {
   next();
 }
 
-function buildN8nUrl(path) {
-  const baseUrl = N8N_API_URL.replace(/\/+$/, "");
+function buildUrl(base, path) {
+  const cleanBase = base.replace(/\/+$/, "");
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
 
-  return `${baseUrl}${cleanPath}`;
+  return `${cleanBase}${cleanPath}`;
+}
+
+function buildN8nUrl(path) {
+  return buildUrl(N8N_API_URL, path);
+}
+
+function buildN8nWebhookUrl(path) {
+  requireWebhookEnv();
+
+  return buildUrl(N8N_WEBHOOK_BASE_URL, path);
+}
+
+async function parseResponseBody(response) {
+  const text = await response.text();
+
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return { raw: text };
+  }
 }
 
 async function n8nRequest(path, options = {}) {
@@ -75,18 +116,33 @@ async function n8nRequest(path, options = {}) {
     }
   });
 
-  const text = await response.text();
-
-  let data;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { raw: text };
-  }
+  const data = await parseResponseBody(response);
 
   if (!response.ok) {
     throw new Error(
       `n8n API error ${response.status}: ${JSON.stringify(data)}`
+    );
+  }
+
+  return data;
+}
+
+async function postJson(url, body, options = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await parseResponseBody(response);
+
+  if (!response.ok) {
+    throw new Error(
+      `HTTP POST error ${response.status}: ${JSON.stringify(data)}`
     );
   }
 
@@ -104,10 +160,27 @@ function formatResult(data) {
   };
 }
 
+function publicStatus() {
+  return {
+    name: SERVER_NAME,
+    status: "ok",
+    version: SERVER_VERSION,
+    mcpEndpoint: "/mcp",
+    transport: "sse",
+    auth: "bearer",
+    tools: TOOL_NAMES,
+    sandbox: {
+      workflowId: SANDBOX_WORKFLOW_ID,
+      webhookPath: SANDBOX_WEBHOOK_PATH,
+      webhookBaseUrlConfigured: Boolean(N8N_WEBHOOK_BASE_URL)
+    }
+  };
+}
+
 function createServer() {
   const server = new McpServer({
-    name: "aether-n8n-mcp",
-    version: "0.3.0"
+    name: SERVER_NAME,
+    version: SERVER_VERSION
   });
 
   server.tool(
@@ -256,17 +329,33 @@ function createServer() {
 
   server.tool(
     "execute_workflow",
-    "Execute an n8n workflow by ID. Use only on sandbox workflows unless explicitly approved.",
+    "Execute an n8n workflow by ID. Currently restricted to the sandbox workflow via webhook.",
     {
       workflowId: z.string().describe("The n8n workflow ID.")
     },
     async ({ workflowId }) => {
-      const result = await n8nRequest(`/workflows/${workflowId}/execute`, {
-        method: "POST",
-        body: JSON.stringify({})
+      if (workflowId !== SANDBOX_WORKFLOW_ID) {
+        throw new Error(
+          `execute_workflow is currently restricted to sandbox workflow ${SANDBOX_WORKFLOW_ID}. Refusing to execute workflow ${workflowId}.`
+        );
+      }
+
+      const webhookUrl = buildN8nWebhookUrl(SANDBOX_WEBHOOK_PATH);
+
+      const result = await postJson(webhookUrl, {
+        source: "Notion AI via AETHER n8n MCP",
+        workflowId,
+        milestone: "Hito 2B sandbox webhook execution",
+        requestedAt: new Date().toISOString()
       });
 
-      return formatResult(result);
+      return formatResult({
+        ok: true,
+        workflowId,
+        executionMode: "webhook",
+        webhookUrl,
+        result
+      });
     }
   );
 
@@ -278,15 +367,11 @@ const app = express();
 const transports = {};
 
 app.get("/", (req, res) => {
-  res.json({
-    name: "aether-n8n-mcp",
-    status: "ok",
-    version: "0.3.0",
-    mcpEndpoint: "/mcp",
-    transport: "sse",
-    auth: "bearer",
-    tools: TOOL_NAMES
-  });
+  res.json(publicStatus());
+});
+
+app.get("/health", (req, res) => {
+  res.json(publicStatus());
 });
 
 app.get("/mcp", requireAuth, async (req, res) => {
@@ -318,5 +403,5 @@ app.post(
 );
 
 app.listen(PORT, () => {
-  console.log(`AETHER n8n MCP SSE server running on port ${PORT}`);
+  console.log(`${SERVER_NAME} SSE server running on port ${PORT}`);
 });
