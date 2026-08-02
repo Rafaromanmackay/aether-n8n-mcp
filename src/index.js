@@ -126,12 +126,11 @@ function createServer() {
       const existing = await n8nRequest(`/workflows/${workflowId}`);
 
       const payload = {
-        name,
-        nodes: existing.nodes || [],
-        connections: existing.connections || {},
-        settings: existing.settings || {},
-        active: existing.active || false
-      };
+  name,
+  nodes: existing.nodes || [],
+  connections: existing.connections || {},
+  settings: existing.settings || {}
+};
 
       const result = await n8nRequest(`/workflows/${workflowId}`, {
         method: "PUT",
