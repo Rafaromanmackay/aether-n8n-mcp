@@ -1,7 +1,7 @@
 import express from "express";
-
-const app = express();
-app.use(express.json({ limit: "10mb" }));
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { z } from "zod";
 
 const PORT = process.env.PORT || 3000;
 const N8N_API_URL = process.env.N8N_API_URL;
@@ -48,7 +48,7 @@ async function n8nRequest(path, options = {}) {
   return data;
 }
 
-function toolResponse(data) {
+function formatResult(data) {
   return {
     content: [
       {
@@ -59,177 +59,126 @@ function toolResponse(data) {
   };
 }
 
-const tools = [
-  {
-    name: "list_workflows",
-    description: "List n8n workflows from the connected n8n instance.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        limit: {
-          type: "number",
-          description: "Maximum number of workflows to return."
-        }
-      }
+function createServer() {
+  const server = new McpServer({
+    name: "aether-n8n-mcp",
+    version: "0.2.0"
+  });
+
+  server.tool(
+    "list_workflows",
+    "List n8n workflows from the connected n8n instance.",
+    {
+      limit: z.number().optional().describe("Maximum number of workflows to return.")
+    },
+    async ({ limit = 50 }) => {
+      const result = await n8nRequest(`/workflows?limit=${limit}`);
+      return formatResult(result);
     }
-  },
-  {
-    name: "get_workflow",
-    description: "Get a full n8n workflow by ID.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workflowId: {
-          type: "string",
-          description: "The n8n workflow ID."
-        }
-      },
-      required: ["workflowId"]
+  );
+
+  server.tool(
+    "get_workflow",
+    "Get a full n8n workflow by ID.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID.")
+    },
+    async ({ workflowId }) => {
+      const result = await n8nRequest(`/workflows/${workflowId}`);
+      return formatResult(result);
     }
-  },
-  {
-    name: "update_workflow",
-    description: "Update an existing n8n workflow. Use carefully.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workflowId: {
-          type: "string",
-          description: "The n8n workflow ID."
-        },
-        workflow: {
-          type: "object",
-          description: "The full updated workflow payload."
-        }
-      },
-      required: ["workflowId", "workflow"]
+  );
+
+  server.tool(
+    "update_workflow",
+    "Update an existing n8n workflow. Use carefully and only with a full workflow payload.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID."),
+      workflow: z.record(z.any()).describe("The full updated workflow payload.")
+    },
+    async ({ workflowId, workflow }) => {
+      const result = await n8nRequest(`/workflows/${workflowId}`, {
+        method: "PUT",
+        body: JSON.stringify(workflow)
+      });
+      return formatResult(result);
     }
-  },
-  {
-    name: "activate_workflow",
-    description: "Activate an n8n workflow by ID.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workflowId: {
-          type: "string",
-          description: "The n8n workflow ID."
-        }
-      },
-      required: ["workflowId"]
+  );
+
+  server.tool(
+    "activate_workflow",
+    "Activate an n8n workflow by ID.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID.")
+    },
+    async ({ workflowId }) => {
+      const result = await n8nRequest(`/workflows/${workflowId}/activate`, {
+        method: "POST"
+      });
+      return formatResult(result);
     }
-  },
-  {
-    name: "deactivate_workflow",
-    description: "Deactivate an n8n workflow by ID.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workflowId: {
-          type: "string",
-          description: "The n8n workflow ID."
-        }
-      },
-      required: ["workflowId"]
+  );
+
+  server.tool(
+    "deactivate_workflow",
+    "Deactivate an n8n workflow by ID.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID.")
+    },
+    async ({ workflowId }) => {
+      const result = await n8nRequest(`/workflows/${workflowId}/deactivate`, {
+        method: "POST"
+      });
+      return formatResult(result);
     }
-  }
-];
+  );
+
+  return server;
+}
+
+const app = express();
+
+const transports = {};
 
 app.get("/", (req, res) => {
   res.json({
     name: "aether-n8n-mcp",
     status: "ok",
     mcpEndpoint: "/mcp",
-    tools: tools.map((tool) => tool.name)
+    transport: "sse",
+    tools: [
+      "list_workflows",
+      "get_workflow",
+      "update_workflow",
+      "activate_workflow",
+      "deactivate_workflow"
+    ]
   });
 });
 
-app.post("/mcp", async (req, res) => {
-  try {
-    const { jsonrpc, id, method, params } = req.body || {};
+app.get("/mcp", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
 
-    if (method === "initialize") {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          protocolVersion: "2024-11-05",
-          capabilities: {
-            tools: {}
-          },
-          serverInfo: {
-            name: "aether-n8n-mcp",
-            version: "0.1.0"
-          }
-        }
-      });
-    }
+  res.on("close", () => {
+    delete transports[transport.sessionId];
+  });
 
-    if (method === "tools/list") {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          tools
-        }
-      });
-    }
+  const server = createServer();
+  await server.connect(transport);
+});
 
-    if (method === "tools/call") {
-      const toolName = params?.name;
-      const args = params?.arguments || {};
+app.post("/messages", express.json({ limit: "10mb" }), async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports[sessionId];
 
-      let result;
-
-      if (toolName === "list_workflows") {
-        const limit = args.limit || 50;
-        result = await n8nRequest(`/workflows?limit=${limit}`);
-      } else if (toolName === "get_workflow") {
-        result = await n8nRequest(`/workflows/${args.workflowId}`);
-      } else if (toolName === "update_workflow") {
-        result = await n8nRequest(`/workflows/${args.workflowId}`, {
-          method: "PUT",
-          body: JSON.stringify(args.workflow)
-        });
-      } else if (toolName === "activate_workflow") {
-        result = await n8nRequest(`/workflows/${args.workflowId}/activate`, {
-          method: "POST"
-        });
-      } else if (toolName === "deactivate_workflow") {
-        result = await n8nRequest(`/workflows/${args.workflowId}/deactivate`, {
-          method: "POST"
-        });
-      } else {
-        throw new Error(`Unknown tool: ${toolName}`);
-      }
-
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: toolResponse(result)
-      });
-    }
-
-    return res.json({
-      jsonrpc: "2.0",
-      id,
-      error: {
-        code: -32601,
-        message: `Method not found: ${method}`
-      }
-    });
-  } catch (error) {
-    return res.json({
-      jsonrpc: "2.0",
-      id: req.body?.id,
-      error: {
-        code: -32000,
-        message: error.message
-      }
-    });
+  if (!transport) {
+    return res.status(400).send("No transport found for sessionId");
   }
+
+  await transport.handlePostMessage(req, res, req.body);
 });
 
 app.listen(PORT, () => {
-  console.log(`AETHER n8n MCP server running on port ${PORT}`);
+  console.log(`AETHER n8n MCP SSE server running on port ${PORT}`);
 });
