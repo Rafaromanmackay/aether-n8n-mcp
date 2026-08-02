@@ -1,6 +1,6 @@
 {
   "name": "aether-n8n-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AETHER MCP server for editing n8n workflows via the n8n API.",
   "type": "module",
   "main": "src/index.js",
