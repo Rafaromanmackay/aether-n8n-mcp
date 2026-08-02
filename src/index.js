@@ -12,10 +12,7 @@ const N8N_WEBHOOK_BASE_URL = process.env.N8N_WEBHOOK_BASE_URL;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 const SERVER_NAME = "aether-n8n-mcp";
-const SERVER_VERSION = "0.4.0";
-
-const SANDBOX_WORKFLOW_ID = "PUvD2zLvDp9kBNQt";
-const SANDBOX_WEBHOOK_PATH = "/webhook/aether-mcp-sandbox-execute";
+const SERVER_VERSION = "0.5.0";
 
 const TOOL_NAMES = [
   "list_workflows",
@@ -27,6 +24,35 @@ const TOOL_NAMES = [
   "deactivate_workflow",
   "execute_workflow"
 ];
+
+const WORKFLOW_REGISTRY = {
+  sandbox_mcp_write_test: {
+    key: "sandbox_mcp_write_test",
+    id: "PUvD2zLvDp9kBNQt",
+    name: "TEMP — MCP Write Test — Updated by Notion",
+    environment: "sandbox",
+    riskLevel: "low",
+    executionMethod: "webhook",
+    webhookPath: "/webhook/aether-mcp-sandbox-execute",
+    allowedActions: ["read", "execute_workflow"],
+    requiresApproval: false,
+    notes:
+      "Sandbox oficial para probar herramientas MCP antes de tocar workflows productivos."
+  },
+  workflow_001_lead_intelligence: {
+    key: "workflow_001_lead_intelligence",
+    id: null,
+    name: "Workflow 001 — Lead Intelligence (RF Coaching)",
+    environment: "production",
+    riskLevel: "high",
+    executionMethod: "blocked",
+    webhookPath: null,
+    allowedActions: ["read"],
+    requiresApproval: true,
+    notes:
+      "Workflow productivo. Fuera de alcance para ejecución automática desde Notion AI."
+  }
+};
 
 function requireEnv() {
   const missing = [];
@@ -149,6 +175,14 @@ async function postJson(url, body, options = {}) {
   return data;
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function createEventId(action) {
+  return `exec_${Date.now()}_${action}`;
+}
+
 function formatResult(data) {
   return {
     content: [
@@ -157,6 +191,162 @@ function formatResult(data) {
         text: JSON.stringify(data, null, 2)
       }
     ]
+  };
+}
+
+function resolveWorkflow({ workflowId, workflowKey }) {
+  if (workflowKey) {
+    return WORKFLOW_REGISTRY[workflowKey] || null;
+  }
+
+  if (workflowId) {
+    return (
+      Object.values(WORKFLOW_REGISTRY).find(
+        (workflow) => workflow.id === workflowId
+      ) || null
+    );
+  }
+
+  return null;
+}
+
+function authorizeAction({ actor, action, workflow }) {
+  if (!workflow) {
+    return {
+      decision: "denied",
+      allowed: false,
+      requiresApproval: false,
+      riskLevel: "high",
+      reason: "Workflow is not registered in WORKFLOW_REGISTRY."
+    };
+  }
+
+  if (!workflow.allowedActions.includes(action)) {
+    return {
+      decision: "denied",
+      allowed: false,
+      requiresApproval: workflow.requiresApproval,
+      riskLevel: workflow.riskLevel,
+      reason: `Action ${action} is not allowed for workflow ${workflow.key}.`
+    };
+  }
+
+  if (workflow.environment === "production") {
+    return {
+      decision: "requires_approval",
+      allowed: false,
+      requiresApproval: true,
+      riskLevel: workflow.riskLevel,
+      reason:
+        "Production workflows require explicit manual approval before execution."
+    };
+  }
+
+  if (workflow.environment !== "sandbox") {
+    return {
+      decision: "requires_approval",
+      allowed: false,
+      requiresApproval: true,
+      riskLevel: workflow.riskLevel,
+      reason: `Environment ${workflow.environment} requires approval.`
+    };
+  }
+
+  if (actor !== "Notion AI") {
+    return {
+      decision: "requires_approval",
+      allowed: false,
+      requiresApproval: true,
+      riskLevel: workflow.riskLevel,
+      reason: `Actor ${actor} is not approved for automatic execution.`
+    };
+  }
+
+  return {
+    decision: "allowed",
+    allowed: true,
+    requiresApproval: false,
+    riskLevel: workflow.riskLevel,
+    reason: "Sandbox workflow execution is allowed for Notion AI."
+  };
+}
+
+function createSimulationResult({
+  eventId,
+  actor,
+  action,
+  workflow,
+  policy,
+  input
+}) {
+  return {
+    ok: false,
+    mode: "simulation",
+    executed: false,
+    eventId,
+    actor,
+    action,
+    requestedAt: nowIso(),
+    policyDecision: policy.decision,
+    reason: policy.reason,
+    approvalRequired: policy.requiresApproval,
+    riskLevel: policy.riskLevel,
+    wouldExecute: {
+      workflowKey: workflow?.key || input.workflowKey || null,
+      workflowId: workflow?.id || input.workflowId || null,
+      workflowName: workflow?.name || null,
+      environment: workflow?.environment || "unknown",
+      executionMethod: workflow?.executionMethod || "unknown",
+      webhookPath: workflow?.webhookPath || null
+    },
+    notes:
+      "Simulation Mode: no workflow was executed. This is a safe preview of the requested action."
+  };
+}
+
+function createExecutionResult({
+  eventId,
+  actor,
+  action,
+  workflow,
+  policy,
+  startedAt,
+  finishedAt,
+  durationMs,
+  status,
+  result,
+  error
+}) {
+  return {
+    ok: status === "success",
+    mode: "execution",
+    executed: status === "success",
+    eventId,
+    actor,
+    action,
+    workflow: {
+      key: workflow.key,
+      id: workflow.id,
+      name: workflow.name,
+      environment: workflow.environment,
+      riskLevel: workflow.riskLevel,
+      executionMethod: workflow.executionMethod,
+      webhookPath: workflow.webhookPath
+    },
+    policy: {
+      decision: policy.decision,
+      reason: policy.reason,
+      approvalRequired: policy.requiresApproval,
+      riskLevel: policy.riskLevel
+    },
+    timing: {
+      startedAt,
+      finishedAt,
+      durationMs
+    },
+    status,
+    result: result || null,
+    error: error || null
   };
 }
 
@@ -169,9 +359,25 @@ function publicStatus() {
     transport: "sse",
     auth: "bearer",
     tools: TOOL_NAMES,
+    controlPlane: {
+      policyEngine: true,
+      workflowRegistry: true,
+      simulationMode: true,
+      executionResultStandard: true,
+      automaticLedgerLogging: false
+    },
+    workflowRegistry: Object.values(WORKFLOW_REGISTRY).map((workflow) => ({
+      key: workflow.key,
+      name: workflow.name,
+      environment: workflow.environment,
+      riskLevel: workflow.riskLevel,
+      executionMethod: workflow.executionMethod,
+      allowedActions: workflow.allowedActions,
+      requiresApproval: workflow.requiresApproval
+    })),
     sandbox: {
-      workflowId: SANDBOX_WORKFLOW_ID,
-      webhookPath: SANDBOX_WEBHOOK_PATH,
+      workflowId: WORKFLOW_REGISTRY.sandbox_mcp_write_test.id,
+      webhookPath: WORKFLOW_REGISTRY.sandbox_mcp_write_test.webhookPath,
       webhookBaseUrlConfigured: Boolean(N8N_WEBHOOK_BASE_URL)
     }
   };
@@ -329,33 +535,142 @@ function createServer() {
 
   server.tool(
     "execute_workflow",
-    "Execute an n8n workflow by ID. Currently restricted to the sandbox workflow via webhook.",
+    "Execute a registered n8n workflow through AETHER Control Plane. Supports Simulation Mode for blocked or unapproved actions.",
     {
-      workflowId: z.string().describe("The n8n workflow ID.")
+      workflowId: z
+        .string()
+        .optional()
+        .describe("The n8n workflow ID. Prefer workflowKey when possible."),
+      workflowKey: z
+        .string()
+        .optional()
+        .describe("The registered workflow key, e.g. sandbox_mcp_write_test."),
+      actor: z
+        .string()
+        .optional()
+        .describe("The actor requesting execution. Defaults to Notion AI."),
+      simulate: z
+        .boolean()
+        .optional()
+        .describe("If true, returns Simulation Mode without executing.")
     },
-    async ({ workflowId }) => {
-      if (workflowId !== SANDBOX_WORKFLOW_ID) {
-        throw new Error(
-          `execute_workflow is currently restricted to sandbox workflow ${SANDBOX_WORKFLOW_ID}. Refusing to execute workflow ${workflowId}.`
+    async ({
+      workflowId,
+      workflowKey = "sandbox_mcp_write_test",
+      actor = "Notion AI",
+      simulate = false
+    }) => {
+      const action = "execute_workflow";
+      const eventId = createEventId(action);
+
+      const workflow = resolveWorkflow({
+        workflowId,
+        workflowKey
+      });
+
+      const policy = authorizeAction({
+        actor,
+        action,
+        workflow
+      });
+
+      if (simulate || !policy.allowed) {
+        return formatResult(
+          createSimulationResult({
+            eventId,
+            actor,
+            action,
+            workflow,
+            policy,
+            input: {
+              workflowId,
+              workflowKey
+            }
+          })
         );
       }
 
-      const webhookUrl = buildN8nWebhookUrl(SANDBOX_WEBHOOK_PATH);
+      if (workflow.executionMethod !== "webhook") {
+        const blockedPolicy = {
+          ...policy,
+          decision: "denied",
+          allowed: false,
+          requiresApproval: true,
+          reason: `Execution method ${workflow.executionMethod} is not executable by this tool.`
+        };
 
-      const result = await postJson(webhookUrl, {
-        source: "Notion AI via AETHER n8n MCP",
-        workflowId,
-        milestone: "Hito 2B sandbox webhook execution",
-        requestedAt: new Date().toISOString()
-      });
+        return formatResult(
+          createSimulationResult({
+            eventId,
+            actor,
+            action,
+            workflow,
+            policy: blockedPolicy,
+            input: {
+              workflowId,
+              workflowKey
+            }
+          })
+        );
+      }
 
-      return formatResult({
-        ok: true,
-        workflowId,
-        executionMode: "webhook",
-        webhookUrl,
-        result
-      });
+      const startedAt = nowIso();
+      const startTime = Date.now();
+
+      try {
+        const webhookUrl = buildN8nWebhookUrl(workflow.webhookPath);
+
+        const result = await postJson(webhookUrl, {
+          source: "Notion AI via AETHER n8n MCP",
+          workflowKey: workflow.key,
+          workflowId: workflow.id,
+          workflowName: workflow.name,
+          environment: workflow.environment,
+          milestone: "AETHER MCP v0.5 governed execution",
+          eventId,
+          requestedAt: startedAt
+        });
+
+        const finishedAt = nowIso();
+        const durationMs = Date.now() - startTime;
+
+        return formatResult(
+          createExecutionResult({
+            eventId,
+            actor,
+            action,
+            workflow,
+            policy,
+            startedAt,
+            finishedAt,
+            durationMs,
+            status: "success",
+            result,
+            error: null
+          })
+        );
+      } catch (error) {
+        const finishedAt = nowIso();
+        const durationMs = Date.now() - startTime;
+
+        return formatResult(
+          createExecutionResult({
+            eventId,
+            actor,
+            action,
+            workflow,
+            policy,
+            startedAt,
+            finishedAt,
+            durationMs,
+            status: "failed",
+            result: null,
+            error: {
+              message: error.message
+            }
+          })
+        );
+      }
     }
   );
 
