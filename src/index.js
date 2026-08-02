@@ -8,6 +8,17 @@ const N8N_API_URL = process.env.N8N_API_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
+const TOOL_NAMES = [
+  "list_workflows",
+  "get_workflow",
+  "rename_workflow",
+  "add_sticky_note",
+  "update_workflow",
+  "activate_workflow",
+  "deactivate_workflow",
+  "execute_workflow"
+];
+
 function requireEnv() {
   if (!N8N_API_URL) {
     throw new Error("Missing N8N_API_URL");
@@ -25,6 +36,7 @@ function requireEnv() {
 function requireAuth(req, res, next) {
   if (!MCP_AUTH_TOKEN) {
     console.error("MCP_AUTH_TOKEN is not configured");
+
     return res.status(500).json({
       error: "MCP server auth is not configured"
     });
@@ -42,10 +54,17 @@ function requireAuth(req, res, next) {
   next();
 }
 
+function buildN8nUrl(path) {
+  const baseUrl = N8N_API_URL.replace(/\/+$/, "");
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+
+  return `${baseUrl}${cleanPath}`;
+}
+
 async function n8nRequest(path, options = {}) {
   requireEnv();
 
-  const url = `${N8N_API_URL}${path}`;
+  const url = buildN8nUrl(path);
 
   const response = await fetch(url, {
     ...options,
@@ -88,17 +107,24 @@ function formatResult(data) {
 function createServer() {
   const server = new McpServer({
     name: "aether-n8n-mcp",
-    version: "0.2.0"
+    version: "0.3.0"
   });
 
   server.tool(
     "list_workflows",
     "List n8n workflows from the connected n8n instance.",
     {
-      limit: z.number().optional().describe("Maximum number of workflows to return.")
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(200)
+        .optional()
+        .describe("Maximum number of workflows to return.")
     },
     async ({ limit = 50 }) => {
       const result = await n8nRequest(`/workflows?limit=${limit}`);
+
       return formatResult(result);
     }
   );
@@ -111,6 +137,7 @@ function createServer() {
     },
     async ({ workflowId }) => {
       const result = await n8nRequest(`/workflows/${workflowId}`);
+
       return formatResult(result);
     }
   );
@@ -227,6 +254,22 @@ function createServer() {
     }
   );
 
+  server.tool(
+    "execute_workflow",
+    "Execute an n8n workflow by ID. Use only on sandbox workflows unless explicitly approved.",
+    {
+      workflowId: z.string().describe("The n8n workflow ID.")
+    },
+    async ({ workflowId }) => {
+      const result = await n8nRequest(`/workflows/${workflowId}/execute`, {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+
+      return formatResult(result);
+    }
+  );
+
   return server;
 }
 
@@ -238,18 +281,11 @@ app.get("/", (req, res) => {
   res.json({
     name: "aether-n8n-mcp",
     status: "ok",
+    version: "0.3.0",
     mcpEndpoint: "/mcp",
     transport: "sse",
     auth: "bearer",
-    tools: [
-      "list_workflows",
-      "get_workflow",
-      "rename_workflow",
-      "add_sticky_note",
-      "update_workflow",
-      "activate_workflow",
-      "deactivate_workflow"
-    ]
+    tools: TOOL_NAMES
   });
 });
 
